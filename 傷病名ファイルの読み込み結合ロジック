@@ -1,0 +1,346 @@
+import os
+import re
+import csv
+from typing import List, Dict, Any, Optional
+
+
+# ----------------------------
+# Tree解析
+# ----------------------------
+
+def count_depth(line: str) -> int:
+    """
+    sklearn export_text() 風のツリー文字列の深さを数える。
+    例:
+    |--- x <= 0.50         -> depth 0
+    |   |--- y > 0.50      -> depth 1
+    """
+    return line.count("|   ")
+
+
+def parse_branch_condition(content: str) -> Optional[Dict[str, str]]:
+    """
+    分岐条件行を解析する。
+    例:
+      c90 <= 0.50
+      d1 > 0.50
+    """
+    m = re.match(
+        r'([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|<|>|==|!=)\s*([-+]?\d+(?:\.\d+)?)',
+        content
+    )
+
+    if not m:
+        return None
+
+    feature, operator, threshold = m.groups()
+
+    return {
+        "feature": feature,
+        "operator": operator,
+        "threshold": threshold,
+        "raw": f"{feature} {operator} {threshold}"
+    }
+
+
+def parse_weights(content: str) -> Optional[Dict[str, Any]]:
+    """
+    weights 行を解析する。
+    例:
+      weights: [10.00, 0.00, 0.00, 0.00] class: 0
+    """
+    m = re.search(r'weights:\s*\[([^\]]+)\]\s*class:\s*(\d+)', content)
+
+    if not m:
+        return None
+
+    weights_str, class_str = m.groups()
+    weights = [float(x.strip()) for x in weights_str.split(",")]
+    predicted_class = int(class_str)
+
+    return {
+        "weights": weights,
+        "predicted_class": predicted_class
+    }
+
+
+def is_target_leaf(weights: List[float], threshold: float = 10.0, eps: float = 1e-9):
+    """
+    条件:
+    - 0以外がちょうど1つだけ
+    - その唯一の値が threshold 以上
+    """
+    nonzero = [(i, w) for i, w in enumerate(weights) if abs(w) > eps]
+
+    if len(nonzero) != 1:
+        return False, None, None
+
+    idx, value = nonzero[0]
+
+    if value >= threshold:
+        return True, idx, value
+
+    return False, idx, value
+
+
+# ----------------------------
+# Master読み込み
+# ----------------------------
+
+def load_feature_master(path: str) -> Dict[str, str]:
+    """
+    feature_master.csv:
+      code,name
+      d58,手術有無_58
+    """
+    mapping = {}
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+
+        required_cols = {"code", "name"}
+        if not required_cols.issubset(set(reader.fieldnames or [])):
+            raise ValueError(f"{path} に必要列 {required_cols} がありません。実際の列: {reader.fieldnames}")
+
+        for row in reader:
+            code = row["code"].strip()
+            name = row["name"].strip()
+            if code:
+                mapping[code] = name
+
+    return mapping
+
+
+def load_class_master(path: str) -> Dict[int, str]:
+    """
+    class_master.csv:
+      class_id,class_name
+      0,対象外
+    """
+    mapping = {}
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+
+        required_cols = {"class_id", "class_name"}
+        if not required_cols.issubset(set(reader.fieldnames or [])):
+            raise ValueError(f"{path} に必要列 {required_cols} がありません。実際の列: {reader.fieldnames}")
+
+        for row in reader:
+            class_id_raw = row["class_id"].strip()
+            class_name = row["class_name"].strip()
+
+            if class_id_raw == "":
+                continue
+
+            mapping[int(class_id_raw)] = class_name
+
+    return mapping
+
+
+# ----------------------------
+# 条件翻訳
+# ----------------------------
+
+def translate_condition(cond: Dict[str, str], feature_map: Dict[str, str]) -> str:
+    """
+    分岐条件の変数コードをマスタで日本語化する。
+    """
+    feature_name = feature_map.get(cond["feature"], cond["feature"])
+    return f"{feature_name} {cond['operator']} {cond['threshold']}"
+
+
+# ----------------------------
+# 1フォルダ処理
+# ----------------------------
+
+def extract_rules_from_folder(folder_path: str, threshold: float = 10.0) -> List[Dict[str, Any]]:
+    """
+    1病名フォルダを処理する。
+    フォルダ配下に以下がある前提:
+      - tree.txt
+      - feature_master.csv
+      - class_master.csv
+    """
+    tree_file = os.path.join(folder_path, "tree.txt")
+    feature_master_file = os.path.join(folder_path, "feature_master.csv")
+    class_master_file = os.path.join(folder_path, "class_master.csv")
+
+    missing_files = [
+        p for p in [tree_file, feature_master_file, class_master_file]
+        if not os.path.exists(p)
+    ]
+    if missing_files:
+        raise FileNotFoundError(f"必要ファイル不足: {missing_files}")
+
+    feature_map = load_feature_master(feature_master_file)
+    class_map = load_class_master(class_master_file)
+
+    with open(tree_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    stack: List[Optional[Dict[str, str]]] = []
+    results: List[Dict[str, Any]] = []
+
+    disease_name = os.path.basename(folder_path.rstrip("/"))
+
+    for line_no, line in enumerate(lines, start=1):
+        if "---" not in line:
+            continue
+
+        depth = count_depth(line)
+        content = line.split("---", 1)[1].strip()
+
+        # 省略枝は除外
+        if "truncated branch" in content.lower():
+            continue
+
+        # 葉ノード判定
+        weights_info = parse_weights(content)
+        if weights_info is not None:
+            weights = weights_info["weights"]
+            predicted_class = weights_info["predicted_class"]
+
+            ok, nonzero_idx, value = is_target_leaf(weights, threshold=threshold)
+
+            if ok:
+                conditions = [c for c in stack[:depth] if c is not None]
+
+                raw_conditions = [c["raw"] for c in conditions]
+                named_conditions = [translate_condition(c, feature_map) for c in conditions]
+
+                results.append({
+                    "disease": disease_name,
+                    "folder_path": folder_path,
+                    "line_no": line_no,
+                    "class_id": predicted_class,
+                    "class_name": class_map.get(predicted_class, str(predicted_class)),
+                    "nonzero_class_index": nonzero_idx,
+                    "value": value,
+                    "weights": ",".join(str(x) for x in weights),
+                    "conditions_raw": " AND ".join(raw_conditions),
+                    "conditions_named": " AND ".join(named_conditions)
+                })
+
+            continue
+
+        # 分岐条件判定
+        cond = parse_branch_condition(content)
+        if cond is not None:
+            if len(stack) <= depth:
+                stack.extend([None] * (depth - len(stack) + 1))
+
+            stack[depth] = cond
+            # 深い階層の古い条件を捨てる
+            stack = stack[:depth + 1]
+
+    return results
+
+
+# ----------------------------
+# 全フォルダ処理
+# ----------------------------
+
+def process_all_disease_folders(base_dir: str, threshold: float = 10.0) -> List[Dict[str, Any]]:
+    """
+    親フォルダ配下の病名フォルダを順に処理する。
+    各病名フォルダごとに独立した master を読む。
+    """
+    all_results: List[Dict[str, Any]] = []
+    error_logs: List[Dict[str, str]] = []
+
+    for name in sorted(os.listdir(base_dir)):
+        folder_path = os.path.join(base_dir, name)
+
+        if not os.path.isdir(folder_path):
+            continue
+
+        print(f"Processing: {folder_path}")
+
+        try:
+            results = extract_rules_from_folder(folder_path, threshold=threshold)
+            all_results.extend(results)
+            print(f"  -> extracted: {len(results)} rows")
+
+        except Exception as e:
+            error_logs.append({
+                "disease": name,
+                "folder_path": folder_path,
+                "error": str(e)
+            })
+            print(f"  -> ERROR: {e}")
+
+    return all_results, error_logs
+
+
+# ----------------------------
+# CSV保存
+# ----------------------------
+
+def save_results_csv(results: List[Dict[str, Any]], output_path: str) -> None:
+    fieldnames = [
+        "disease",
+        "folder_path",
+        "line_no",
+        "class_id",
+        "class_name",
+        "nonzero_class_index",
+        "value",
+        "weights",
+        "conditions_raw",
+        "conditions_named"
+    ]
+
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in results:
+            writer.writerow(row)
+
+
+def save_error_log_csv(error_logs: List[Dict[str, str]], output_path: str) -> None:
+    fieldnames = ["disease", "folder_path", "error"]
+
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in error_logs:
+            writer.writerow(row)
+
+
+# ----------------------------
+# 実行
+# ----------------------------
+
+if __name__ == "__main__":
+    # Databricks 例:
+    # /dbfs/FileStore/decision_tree/
+    #   ├ 病名A/
+    #   │   ├ tree.txt
+    #   │   ├ feature_master.csv
+    #   │   └ class_master.csv
+    #   ├ 病名B/
+    #   │   ├ tree.txt
+    #   │   ├ feature_master.csv
+    #   │   └ class_master.csv
+
+    base_dir = "/dbfs/FileStore/decision_tree"
+    output_csv = "/dbfs/FileStore/decision_tree/decision_tree_rules_all.csv"
+    error_csv = "/dbfs/FileStore/decision_tree/decision_tree_rules_errors.csv"
+
+    threshold = 10.0
+
+    all_results, error_logs = process_all_disease_folders(
+        base_dir=base_dir,
+        threshold=threshold
+    )
+
+    save_results_csv(all_results, output_csv)
+    save_error_log_csv(error_logs, error_csv)
+
+    print(f"完了: {output_csv}")
+    print(f"件数: {len(all_results)}")
+    print(f"エラーログ: {error_csv}")
+    print(f"エラー件数: {len(error_logs)}")
