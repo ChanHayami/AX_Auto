@@ -1,0 +1,43 @@
+Pythonで、決定木の export_text() 風テキストを解析する完成コードを書いてください。
+
+目的:
+- tree.txt から葉ノードを抽出
+- `weights: [...] class: n` を葉ノードとみなす
+- weights のうち 0以外が1つだけ、かつその値が10以上の葉だけ対象
+- その葉に至る全分岐条件を root から leaf の順で取得
+- feature_master.csv で d58 や c185 を日本語名に変換
+- class_master.csv で predicted class を日本語名に変換
+- CSVに保存
+
+入力:
+1. tree.txt
+2. feature_master.csv（code,name）
+3. class_master.csv（class_id,class_name）
+
+出力:
+decision_tree_rules.csv
+
+CSV列:
+- line_no
+- class_id
+- class_name
+- value
+- weights
+- conditions_raw
+- conditions_named
+
+制約:
+- Python標準ライブラリのみ
+- re と csv のみ使用
+- UTF-8-sig でCSV出力
+- `truncated branch` を含む行は除外
+- 深さは `|   ` の数で判定
+- コメント付き
+- そのまま実行できる完成コード
+- `if __name__ == "__main__":` を含める
+
+必ず以下の順番で出力:
+1. 実装仕様の整理
+2. Pythonコード全文
+3. 関数説明
+4. 実行例
