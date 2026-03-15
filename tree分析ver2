@@ -1,0 +1,516 @@
+"""
+parse_decision_tree.py
+======================
+目的:
+    sklearn の DecisionTreeClassifier.export_text() が出力したテキストを解析し、
+    「葉ノードへ至る全分岐条件」を抽出して CSV にまとめる。
+
+設計方針（解法①：スタックベース逐次処理）を採用した理由:
+    - export_text() の構造的本質は「インデント深度 = スタック深度」であり、
+      スタックが最も素直に対応できる。
+    - 葉ノード到達時にスタックをそのまま読むと「ルート→葉への条件リスト」が
+      自明に得られるため、再帰・バックトラック等の複雑な処理が不要。
+    - 純粋 Python（追加依存ゼロ）なので Databricks 上でそのまま動作する。
+    - 抽出結果を pd.DataFrame に渡すことで Databricks の display() や
+      Spark テーブルへの書き出しにも自然につなげられる（ハイブリッド構成）。
+
+対象フォルダ構造:
+    base_dir/
+        K000001_うなうな/
+            K000001_tree.txt
+            K000001_features_dict.txt
+        L123456_ほげほげ/
+            L123456_tree.txt
+            L123456_features_dict.txt
+
+export_text() のフォーマット例:
+    |--- di0 <= 0.50
+    |   |--- co0 <= 0.25
+    |   |   |--- weights: [120.0, 0.0, 0.0]   ← 葉ノード
+    |   |--- co0 > 0.25
+    |   |   |--- weights: [0.0, 45.0, 0.0]    ← 葉ノード
+
+制約・フィルタ条件:
+    1. weights のうち 0以外の要素が 1つだけであること
+    2. その唯一の非ゼロ値が 10 以上であること
+    3. class=1（インデックス1の重み）の場合はフォルダ名で日本語化
+       class=0 の場合はそのまま "0" と表記
+
+出力 CSV カラム:
+    disease_code    : 傷病コード（例: K000001）
+    disease_name_ja : フォルダ名から取得した日本語病名
+    leaf_class      : 0 または病名（日本語）
+    leaf_weight     : 非ゼロの重み値
+    conditions      : ルートから葉への条件を " AND " で連結した文字列
+    conditions_ja   : 条件コードを日本語に変換した文字列
+
+作成者: YOSHIHITO
+作成日: 2025
+"""
+
+import os
+import re
+import ast
+import pandas as pd
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# 定数
+# ---------------------------------------------------------------------------
+
+# export_text() のインデント単位: "|   " = パイプ + スペース3つ（4文字）
+# sklearn のソースコードを確認すると INDENT = "|   " が固定値として使われている。
+# 将来のバージョンでここが変わる場合はこの定数を修正するだけでよい。
+INDENT_UNIT = "|   "
+INDENT_LEN  = len(INDENT_UNIT)  # = 4
+
+# 各行のノード開始マーカー
+# export_text() は全ノード行を "|--- " で始める。
+NODE_MARKER = "|--- "
+
+# 葉ノード識別キーワード
+# 分岐ノードは "feature_name <= value" の形式だが、
+# 葉ノードのみ "weights: [...]" という形式になる。
+LEAF_KEYWORD = "weights:"
+
+
+# ---------------------------------------------------------------------------
+# ユーティリティ関数
+# ---------------------------------------------------------------------------
+
+def calc_depth(line: str) -> int:
+    """
+    行のインデント深度を計算する。
+
+    Args:
+        line: ファイルから読んだ1行（改行除去済み）
+
+    Returns:
+        深度（0 = ルート直下）
+
+    実装の根拠:
+        export_text() はインデントを "|   " の繰り返しで表現する。
+        1行のインデント部分の文字数 ÷ INDENT_LEN = 深度になる。
+        "|--- " の前に "|   " が n 個あれば深度 n。
+
+        例: "|   |   |--- weights: [...]"
+              ^^^^    = 深度2（先頭から NODE_MARKER までの "|   " の数）
+    """
+    depth = 0
+    pos = 0
+    while line[pos:pos + INDENT_LEN] == INDENT_UNIT:
+        depth += 1
+        pos += INDENT_LEN
+    return depth
+
+
+def parse_weights(weights_str: str) -> list[float]:
+    """
+    "weights: [120.0, 0.0, 45.0]" の文字列から float リストを返す。
+
+    Args:
+        weights_str: weights以降の文字列部分
+
+    Returns:
+        float のリスト
+
+    実装の根拠:
+        export_text() は weights を Python リスト表記で出力するため、
+        ast.literal_eval() で安全にパースできる（eval() は使わない）。
+        JSON の json.loads() ではなく ast を使う理由は、
+        Python の float 表記（例: 1e-5）に対応するため。
+    """
+    # "weights: [120.0, 0.0]" → "[120.0, 0.0]"
+    bracket_str = weights_str.split("weights:")[1].strip()
+    return ast.literal_eval(bracket_str)
+
+
+def is_valid_leaf(weights: list[float]) -> bool:
+    """
+    葉ノードが対象条件を満たすか判定する。
+
+    条件:
+        1. 0以外の要素が 1つだけ
+        2. その値が 10 以上
+
+    Args:
+        weights: parse_weights() で得た float リスト
+
+    Returns:
+        True = 対象葉ノード
+
+    実装の根拠:
+        weights の非ゼロ要素が1つだけ = その葉は単一クラスに純化している。
+        値 >= 10 = サンプル数が十分にある（ノイズ的な葉を除外）。
+        sum() や list comprehension で簡潔に書けるため、ループ展開は不要。
+    """
+    non_zero = [w for w in weights if w != 0.0]
+    return len(non_zero) == 1 and non_zero[0] >= 10.0
+
+
+def get_leaf_class_and_weight(
+    weights: list[float],
+    disease_name_ja: str
+) -> tuple[str, float]:
+    """
+    葉ノードのクラス表現と重み値を返す。
+
+    Args:
+        weights       : float リスト（非ゼロが1つだけであることが前提）
+        disease_name_ja: フォルダ名から取得した日本語病名
+
+    Returns:
+        (leaf_class, leaf_weight)
+        - class=1（インデックス1）の場合は disease_name_ja を返す
+        - class=0 の場合は "0" を返す
+        - それ以外のインデックスの場合はインデックス番号を文字列で返す
+
+    実装の根拠:
+        weights のインデックスが sklearn の class ラベルに対応する。
+        index=0 → class 0（非疾患）→ "0" のまま表示
+        index=1 → class 1（対象疾患）→ フォルダ日本語名で表示
+        index>=2 → 多クラス時の想定外ケース（拡張性のため残す）
+    """
+    for idx, w in enumerate(weights):
+        if w != 0.0:
+            weight_val = w
+            if idx == 0:
+                leaf_class = "0"
+            elif idx == 1:
+                leaf_class = disease_name_ja
+            else:
+                # 3クラス以上のモデルにも対応できるよう番号を返す
+                leaf_class = str(idx)
+            return leaf_class, weight_val
+
+    # ここには到達しないはず（is_valid_leaf() で確認済み）
+    raise ValueError(f"非ゼロ要素が見つからない weights: {weights}")
+
+
+def load_feature_dict(path: str) -> dict[str, str]:
+    """
+    features_dict.txt を読み込んで Python 辞書として返す。
+
+    Args:
+        path: features_dict.txt のファイルパス
+
+    Returns:
+        {'di0': 'disease_name_ガン', 'co0': 'complication_name_ほげ', ...}
+
+    実装の根拠:
+        features_dict.txt は Python 辞書リテラルで記述されている想定のため、
+        ast.literal_eval() で安全に読み込む。
+        json.loads() を使わない理由は、シングルクォート使用の Python 辞書記法に
+        対応するため（JSON はダブルクォートのみ）。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    return ast.literal_eval(content)
+
+
+def translate_condition(condition: str, feature_dict: dict[str, str]) -> str:
+    """
+    分岐条件のフィーチャーコードを日本語に変換する。
+
+    Args:
+        condition   : "di0 <= 0.50" のような条件文字列
+        feature_dict: コード→日本語マッピング辞書
+
+    Returns:
+        "disease_name_ガン <= 0.50" のような日本語化済み文字列
+
+    実装の根拠:
+        条件文字列の先頭が必ずフィーチャーコードになっている（export_text() の仕様）。
+        コードが辞書に存在しない場合は元のコードをそのまま返す（KeyError を出さない）ことで、
+        辞書の不完全性によって処理全体が止まるのを防ぐ。
+
+        re.split() ではなく、最初のスペースで split(maxsplit=1) を使う理由:
+        フィーチャー名やしきい値にスペースが混入した場合の耐性を持たせるため。
+    """
+    parts = condition.split(" ", maxsplit=1)
+    if not parts:
+        return condition
+
+    code = parts[0]
+    remainder = parts[1] if len(parts) > 1 else ""
+    ja_name = feature_dict.get(code, code)  # 辞書にない場合は元コードを保持
+
+    return f"{ja_name} {remainder}".strip()
+
+
+# ---------------------------------------------------------------------------
+# コアロジック：スタックベース逐次処理
+# ---------------------------------------------------------------------------
+
+def extract_leaves_from_tree(
+    tree_text: str,
+    feature_dict: dict[str, str],
+    disease_code: str,
+    disease_name_ja: str,
+) -> list[dict]:
+    """
+    決定木テキストを1行ずつ解析し、有効な葉ノードのレコードリストを返す。
+
+    Args:
+        tree_text      : tree.txt の全文字列
+        feature_dict   : コード→日本語辞書
+        disease_code   : 傷病コード（例: "K000001"）
+        disease_name_ja: 日本語病名（例: "うなうな"）
+
+    Returns:
+        各葉ノードを表す辞書のリスト
+
+    アルゴリズム（スタックベース）の詳細:
+        スタックを「深度→条件文字列」のマッピングとして使う。
+        リスト（インデックス = 深度）として実装することで、
+        dict よりも O(1) アクセスを保ちつつシンプルに書ける。
+
+        各行に対して:
+        1. 深度を計算
+        2. スタックを現在の深度にトリム（深い分岐が終わって戻ってきた場合）
+        3. 分岐ノードならスタックに条件を積む
+        4. 葉ノードならスタック全体を「ルート→葉への条件リスト」として回収
+
+        スタックのトリムが重要な理由:
+            決定木は左部分木を全部掘り下げてから右部分木に移る DFS 順で出力される。
+            右部分木に移る際、スタックには左部分木の深い条件が残っているため、
+            現在の深度に合わせてトリムしないと条件が混入する。
+
+        例:
+            深度0: A <= 0.5      → stack = ["A <= 0.5"]
+            深度1:   B <= 0.3    → stack = ["A <= 0.5", "B <= 0.3"]
+            深度2:     weights   → 葉。conditions = ["A <= 0.5", "B <= 0.3"]
+            深度1:   B > 0.3     → depth=1 → stack を depth=1 にトリム
+                                 → stack = ["A <= 0.5"] → push → ["A <= 0.5", "B > 0.3"]
+            深度2:     weights   → 葉。conditions = ["A <= 0.5", "B > 0.3"]
+    """
+    records = []
+
+    # スタック: インデックス i = 深度 i の条件文字列
+    # list として実装; append / スライスでトリムができる
+    condition_stack: list[str] = []
+
+    lines = tree_text.splitlines()
+
+    for line in lines:
+        stripped = line.rstrip()
+
+        # 空行はスキップ
+        if not stripped:
+            continue
+
+        # NODE_MARKER を含まない行（ヘッダー行など）はスキップ
+        # export_text() の出力は全ノード行が "|--- " を含む
+        if NODE_MARKER not in stripped:
+            continue
+
+        # ---- 深度の計算 ----
+        depth = calc_depth(stripped)
+
+        # ノード内容（"|--- " より後の部分）を取り出す
+        # NODE_MARKER の位置を rfind で探す理由:
+        #   インデント部の "|   " にも "|" が含まれるため、
+        #   最後の "|--- " を探すことで正しい内容部分を取得できる
+        marker_pos = stripped.rfind(NODE_MARKER)
+        content = stripped[marker_pos + len(NODE_MARKER):]
+
+        # ---- スタックのトリム ----
+        # 現在の深度に合わせてスタックを切り詰める。
+        # condition_stack[i] = 深度 i の条件、なので
+        # 深度 depth のノードを処理する前に深度 depth 以降は不要。
+        condition_stack = condition_stack[:depth]
+
+        # ---- ノード種別の判定と処理 ----
+        if LEAF_KEYWORD in content:
+            # == 葉ノード ==
+            weights = parse_weights(content)
+
+            # フィルタ: 非ゼロが1つかつ値が10以上の葉のみ対象
+            if not is_valid_leaf(weights):
+                continue
+
+            leaf_class, leaf_weight = get_leaf_class_and_weight(
+                weights, disease_name_ja
+            )
+
+            # 条件を英語（コードのまま）と日本語の両方で保持
+            # 英語版は後でデバッグ・再利用に使える
+            conditions_raw = list(condition_stack)  # コピーして保持
+            conditions_ja  = [
+                translate_condition(c, feature_dict) for c in conditions_raw
+            ]
+
+            records.append({
+                "disease_code"    : disease_code,
+                "disease_name_ja" : disease_name_ja,
+                "leaf_class"      : leaf_class,
+                "leaf_weight"     : leaf_weight,
+                # AND 結合文字列: SQL の WHERE 句に近い形式で可読性が高い
+                "conditions"      : " AND ".join(conditions_raw),
+                "conditions_ja"   : " AND ".join(conditions_ja),
+            })
+
+        else:
+            # == 分岐ノード ==
+            # 条件をスタックに積む
+            # content は "di0 <= 0.50" のような文字列
+            condition_stack.append(content)
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# フォルダ走査・メイン処理
+# ---------------------------------------------------------------------------
+
+def parse_disease_folder(folder_path: Path) -> list[dict]:
+    """
+    1つの病名フォルダを処理してレコードリストを返す。
+
+    Args:
+        folder_path: 病名フォルダの Path オブジェクト
+
+    Returns:
+        そのフォルダの有効葉ノードレコードリスト。
+        エラー時は空リストを返して処理を継続する。
+
+    実装の根拠:
+        フォルダ名から病名コードと日本語名を分離する。
+        フォルダ名の命名規則: "{code}_{japanese_name}"
+        最初のアンダースコアで分割することで、
+        日本語名に複数のアンダースコアが含まれても対応できる。
+    """
+    folder_name = folder_path.name
+
+    # フォルダ名から disease_code と disease_name_ja を分離
+    # "K000001_うなうな" → code="K000001", name_ja="うなうな"
+    # maxsplit=1 で最初のアンダースコアだけで分割
+    parts = folder_name.split("_", maxsplit=1)
+    if len(parts) != 2:
+        print(f"[WARN] フォルダ名の形式が想定外のためスキップ: {folder_name}")
+        return []
+
+    disease_code, disease_name_ja = parts
+
+    # ファイルパスの構築
+    tree_path    = folder_path / f"{disease_code}_tree.txt"
+    feature_path = folder_path / f"{disease_code}_features_dict.txt"
+
+    # ファイル存在チェック: 片方でも欠けていればスキップして継続
+    # raise せずに空リストを返すことで、1フォルダのエラーが全体を止めない
+    if not tree_path.exists():
+        print(f"[WARN] tree.txt が見つかりません: {tree_path}")
+        return []
+    if not feature_path.exists():
+        print(f"[WARN] features_dict.txt が見つかりません: {feature_path}")
+        return []
+
+    # ファイル読み込み
+    # encoding="utf-8" を明示: Databricks のデフォルトが UTF-8 であるため
+    # 将来 Shift-JIS ファイルを扱う場合はここを変更する
+    try:
+        tree_text    = tree_path.read_text(encoding="utf-8")
+        feature_dict = load_feature_dict(str(feature_path))
+    except Exception as e:
+        print(f"[ERROR] ファイル読み込みエラー ({folder_name}): {e}")
+        return []
+
+    # コアロジックを呼び出す
+    records = extract_leaves_from_tree(
+        tree_text, feature_dict, disease_code, disease_name_ja
+    )
+
+    print(f"[INFO] {folder_name}: {len(records)} 件の有効葉ノードを抽出")
+    return records
+
+
+def run(base_dir: str, output_csv: str) -> pd.DataFrame:
+    """
+    base_dir 配下の全病名フォルダを処理し、結果を CSV に出力する。
+
+    Args:
+        base_dir  : 病名フォルダが並んでいる親ディレクトリのパス
+        output_csv: 出力 CSV ファイルのパス
+
+    Returns:
+        結果 DataFrame（Databricks で display() に渡せる形式）
+
+    実装の根拠:
+        Path.iterdir() でフォルダを列挙し、is_dir() でフォルダだけ選ぶ。
+        sorted() でフォルダ名順に処理することで、
+        実行のたびに CSV の行順が安定する（再現性の確保）。
+
+        全レコードをリストに集め最後に pd.DataFrame を1度だけ作る理由:
+        DataFrame に行を逐次 append するのは O(n^2) になるため、
+        リストで集約してから一括構築する（pandas のベストプラクティス）。
+    """
+    base_path = Path(base_dir)
+
+    if not base_path.exists():
+        raise FileNotFoundError(f"base_dir が見つかりません: {base_dir}")
+
+    all_records: list[dict] = []
+
+    # フォルダを名前順にソートして処理（実行のたびに順序を安定させる）
+    folders = sorted(
+        [p for p in base_path.iterdir() if p.is_dir()],
+        key=lambda p: p.name
+    )
+
+    print(f"[INFO] 対象フォルダ数: {len(folders)}")
+
+    for folder_path in folders:
+        records = parse_disease_folder(folder_path)
+        all_records.extend(records)
+
+    # DataFrame 構築（列順を明示して可読性を確保）
+    columns = [
+        "disease_code",
+        "disease_name_ja",
+        "leaf_class",
+        "leaf_weight",
+        "conditions",
+        "conditions_ja",
+    ]
+
+    if not all_records:
+        print("[WARN] 有効な葉ノードが1件も見つかりませんでした。")
+        df = pd.DataFrame(columns=columns)
+    else:
+        df = pd.DataFrame(all_records, columns=columns)
+
+    # CSV 出力
+    # index=False: 行番号は CSV には不要
+    # encoding="utf-8-sig": Excel で開いたときに日本語が文字化けしない BOM 付き UTF-8
+    df.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"[INFO] CSV 出力完了: {output_csv} ({len(df)} 件)")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Databricks エントリポイント
+# ---------------------------------------------------------------------------
+# Databricks Notebook からは以下のようにセルに書いて実行する:
+#
+#   %run /path/to/parse_decision_tree
+#
+#   または
+#
+#   # セルに直接貼り付けて実行し、最後に:
+#   df = run(base_dir="/dbfs/mnt/your-storage/disease_trees",
+#            output_csv="/dbfs/mnt/your-storage/output/leaves.csv")
+#   display(df)
+#
+# ローカルでのテスト実行も可能（if __name__ == "__main__" ブロック）
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # ローカルテスト用のパス設定
+    # Databricks 上では上記コメントのように直接 run() を呼ぶこと
+    BASE_DIR   = "./sample_data"          # テスト用ローカルディレクトリ
+    OUTPUT_CSV = "./output_leaves.csv"    # 出力先
+
+    result_df = run(BASE_DIR, OUTPUT_CSV)
+    print(result_df.to_string())
